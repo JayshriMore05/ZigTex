@@ -9,6 +9,100 @@ if (!isset($_SESSION['user_id'])) {
 
 $user_id = $_SESSION['user_id'];
 
+// Handle actions (Edit, Delete, Pause, etc.)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    $campaign_id = $_POST['campaign_id'] ?? 0;
+    
+    if ($campaign_id > 0) {
+        try {
+            $pdo = db();
+            
+            switch ($_POST['action']) {
+                case 'delete':
+                    $stmt = $pdo->prepare("DELETE FROM campaigns WHERE id = ? AND user_id = ?");
+                    $stmt->execute([$campaign_id, $user_id]);
+                    $_SESSION['success'] = 'Campaign deleted successfully!';
+                    break;
+                    
+                case 'pause':
+                    $stmt = $pdo->prepare("UPDATE campaigns SET status = 'paused' WHERE id = ? AND user_id = ? AND status = 'running'");
+                    $stmt->execute([$campaign_id, $user_id]);
+                    $_SESSION['success'] = 'Campaign paused successfully!';
+                    break;
+                    
+                case 'resume':
+                    $stmt = $pdo->prepare("UPDATE campaigns SET status = 'running' WHERE id = ? AND user_id = ? AND status = 'paused'");
+                    $stmt->execute([$campaign_id, $user_id]);
+                    $_SESSION['success'] = 'Campaign resumed successfully!';
+                    break;
+                    
+                case 'duplicate':
+                    // Get the campaign to duplicate
+                    $stmt = $pdo->prepare("SELECT * FROM campaigns WHERE id = ? AND user_id = ?");
+                    $stmt->execute([$campaign_id, $user_id]);
+                    $campaign = $stmt->fetch(PDO::FETCH_ASSOC);
+                    
+                    if ($campaign) {
+                        // Insert new campaign with " Copy" suffix
+                        $stmt = $pdo->prepare("
+                            INSERT INTO campaigns (user_id, name, email_account, unsubscribe_text, email_priority, 
+                                                   timezone, weekly_schedule, start_time, end_time, total_prospects, 
+                                                   status, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                        ");
+                        $new_name = $campaign['name'] . ' Copy';
+                        $stmt->execute([
+                            $user_id,
+                            $new_name,
+                            $campaign['email_account'],
+                            $campaign['unsubscribe_text'],
+                            $campaign['email_priority'],
+                            $campaign['timezone'],
+                            $campaign['weekly_schedule'],
+                            $campaign['start_time'],
+                            $campaign['end_time'],
+                            $campaign['total_prospects'],
+                            'draft'
+                        ]);
+                        
+                        $new_campaign_id = $pdo->lastInsertId();
+                        
+                        // Duplicate campaign steps if any
+                        $stmt = $pdo->prepare("SELECT * FROM campaign_steps WHERE campaign_id = ?");
+                        $stmt->execute([$campaign_id]);
+                        $steps = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                        
+                        foreach ($steps as $step) {
+                            $stmt = $pdo->prepare("
+                                INSERT INTO campaign_steps (campaign_id, step_number, step_type, delay_days, delay_hours, subject, email_body)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            ");
+                            $stmt->execute([
+                                $new_campaign_id,
+                                $step['step_number'],
+                                $step['step_type'],
+                                $step['delay_days'],
+                                $step['delay_hours'],
+                                $step['subject'],
+                                $step['email_body']
+                            ]);
+                        }
+                        
+                        $_SESSION['success'] = 'Campaign duplicated successfully!';
+                    }
+                    break;
+            }
+            
+            // Redirect back to prevent form resubmission
+            header("Location: " . $_SERVER['PHP_SELF']);
+            exit();
+            
+        } catch (PDOException $e) {
+            $_SESSION['error'] = 'Action failed: ' . $e->getMessage();
+        }
+    }
+}
+
 try {
     // Get database connection
     $pdo = db();
@@ -74,6 +168,27 @@ try {
     
 } catch (PDOException $e) {
     die("Database error: " . $e->getMessage());
+}
+
+// Check for success/error messages
+$success_message = '';
+$error_message = '';
+
+if (isset($_SESSION['success'])) {
+    $success_message = $_SESSION['success'];
+    unset($_SESSION['success']);
+} elseif (isset($_SESSION['error'])) {
+    $error_message = $_SESSION['error'];
+    unset($_SESSION['error']);
+}
+
+// Check for success messages from GET
+if (isset($_GET['success'])) {
+    if ($_GET['success'] == 'draft_saved') {
+        $success_message = 'Campaign saved as draft successfully!';
+    } elseif ($_GET['success'] == 'campaign_launched') {
+        $success_message = 'Campaign launched successfully!';
+    }
 }
 ?>
 <!DOCTYPE html>
@@ -180,7 +295,7 @@ try {
     .campaign-table {
         width: 100%;
         border-collapse: collapse;
-        min-width: 1000px;
+        min-width: 1100px;
     }
     
     .campaign-table thead {
@@ -226,19 +341,34 @@ try {
         color: #6b7280;
     }
     
+    /* Animation for status changes */
     .campaign-status-badge {
+        transition: all 0.3s ease;
+    }
+
+    /* Tooltips for actions */
+    .campaign-action-btn {
+        position: relative;
+    }
+
+    .campaign-action-btn:hover::after {
+        content: attr(data-tooltip);
+        position: absolute;
+        top: -30px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: #1f2937;
+        color: white;
         padding: 4px 8px;
         border-radius: 4px;
         font-size: 12px;
-        font-weight: 500;
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
+        white-space: nowrap;
+        z-index: 1000;
     }
     
-    .status-new {
-        background: #dcfce7;
-        color: #166534;
+    .status-draft {
+        background: #e5e7eb;
+        color: #4b5563;
     }
     
     .status-running {
@@ -252,8 +382,13 @@ try {
     }
     
     .status-completed {
-        background: #f3f4f6;
-        color: #4b5563;
+        background: #d1fae5;
+        color: #065f46;
+    }
+    
+    .status-scheduled {
+        background: #ede9fe;
+        color: #5b21b6;
     }
     
     .campaign-stats-cell {
@@ -319,6 +454,61 @@ try {
     .campaign-action-btn:hover {
         background: #f9fafb;
         border-color: #d1d5db;
+    }
+    
+    /* Specific button colors */
+    .btn-edit {
+        color: #3b82f6;
+    }
+    
+    .btn-edit:hover {
+        background: #eff6ff;
+        border-color: #3b82f6;
+    }
+    
+    .btn-view {
+        color: #10b981;
+    }
+    
+    .btn-view:hover {
+        background: #ecfdf5;
+        border-color: #10b981;
+    }
+    
+    .btn-pause {
+        color: #f59e0b;
+    }
+    
+    .btn-pause:hover {
+        background: #fffbeb;
+        border-color: #f59e0b;
+    }
+    
+    .btn-resume {
+        color: #10b981;
+    }
+    
+    .btn-resume:hover {
+        background: #ecfdf5;
+        border-color: #10b981;
+    }
+    
+    .btn-delete {
+        color: #ef4444;
+    }
+    
+    .btn-delete:hover {
+        background: #fef2f2;
+        border-color: #ef4444;
+    }
+    
+    .btn-duplicate {
+        color: #8b5cf6;
+    }
+    
+    .btn-duplicate:hover {
+        background: #f5f3ff;
+        border-color: #8b5cf6;
     }
     
     /* Pagination */
@@ -404,6 +594,120 @@ try {
         margin-bottom: 20px;
     }
     
+    /* Success/Error messages */
+    .success-message {
+        background: #d1fae5;
+        border: 1px solid #10b981;
+        color: #065f46;
+        padding: 12px 16px;
+        border-radius: 6px;
+        margin-bottom: 20px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        animation: fadeIn 0.3s ease;
+    }
+    
+    .error-message {
+        background: #fee2e2;
+        border: 1px solid #ef4444;
+        color: #991b1b;
+        padding: 12px 16px;
+        border-radius: 6px;
+        margin-bottom: 20px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        animation: fadeIn 0.3s ease;
+    }
+    
+    .success-message i {
+        color: #10b981;
+    }
+    
+    .error-message i {
+        color: #ef4444;
+    }
+    
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(-10px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    
+    /* Confirmation Modal */
+    .confirmation-modal {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0,0,0,0.5);
+        z-index: 1000;
+        align-items: center;
+        justify-content: center;
+    }
+    
+    .modal-content {
+        background: white;
+        border-radius: 12px;
+        padding: 30px;
+        width: 90%;
+        max-width: 400px;
+        box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+    }
+    
+    .modal-header {
+        margin-bottom: 20px;
+    }
+    
+    .modal-header h3 {
+        font-size: 18px;
+        color: #1f2937;
+        font-weight: 600;
+    }
+    
+    .modal-body {
+        margin-bottom: 25px;
+        color: #6b7280;
+        font-size: 14px;
+    }
+    
+    .modal-footer {
+        display: flex;
+        justify-content: flex-end;
+        gap: 12px;
+    }
+    
+    .modal-btn {
+        padding: 8px 16px;
+        border-radius: 6px;
+        font-size: 14px;
+        font-weight: 500;
+        cursor: pointer;
+        border: 1px solid #d1d5db;
+        background: white;
+        transition: all 0.2s;
+    }
+    
+    .modal-btn.cancel {
+        color: #6b7280;
+    }
+    
+    .modal-btn.cancel:hover {
+        background: #f9fafb;
+    }
+    
+    .modal-btn.confirm {
+        background: #ef4444;
+        color: white;
+        border-color: #ef4444;
+    }
+    
+    .modal-btn.confirm:hover {
+        background: #dc2626;
+    }
+    
     /* Sidebar Navigation Styles */
     .sidebar-nav {
         list-style: none;
@@ -484,6 +788,16 @@ try {
             gap: 16px;
             align-items: flex-start;
         }
+        
+        .campaign-actions-cell {
+            flex-direction: column;
+            gap: 4px;
+        }
+        
+        .campaign-action-btn {
+            width: 28px;
+            height: 28px;
+        }
     }
     </style>
 </head>
@@ -494,9 +808,24 @@ try {
 
         <!-- Main Content -->
         <main class="main-content">
+            <!-- Success/Error Messages -->
+            <?php if ($success_message): ?>
+            <div class="success-message">
+                <i class="fas fa-check-circle"></i>
+                <span><?php echo $success_message; ?></span>
+            </div>
+            <?php endif; ?>
+            
+            <?php if ($error_message): ?>
+            <div class="error-message">
+                <i class="fas fa-exclamation-circle"></i>
+                <span><?php echo $error_message; ?></span>
+            </div>
+            <?php endif; ?>
+            
             <!-- Campaign Header -->
             <div class="campaign-header">
-                <h1>Campaign</h1>
+                <h1>Campaigns</h1>
                 <a href="campaign_create.php" class="create-campaign-btn">
                     <i class="fas fa-plus"></i> Create Campaign
                 </a>
@@ -523,12 +852,13 @@ try {
                                 <th>REPLIES</th>
                                 <th>BOUNCED</th>
                                 <th>CREATED DATE</th>
+                                <th>ACTIONS</th>
                             </tr>
                         </thead>
                         <tbody id="campaignsTableBody">
                             <?php if (empty($campaigns)): ?>
                             <tr>
-                                <td colspan="7">
+                                <td colspan="8">
                                     <div class="campaign-empty-state">
                                         <i class="fas fa-inbox"></i>
                                         <h3>No campaigns yet</h3>
@@ -541,21 +871,13 @@ try {
                             </tr>
                             <?php else: ?>
                                 <?php 
-                                // Map your status to screenshots status
-                                $status_map = [
-                                    'draft' => 'NEW',
-                                    'scheduled' => 'NEW',
-                                    'running' => 'ACTIVE',
+                                // Map your status to display text
+                                $status_display_map = [
+                                    'draft' => 'DRAFT',
+                                    'scheduled' => 'SCHEDULED',
+                                    'running' => 'RUNNING',
                                     'paused' => 'PAUSED',
                                     'completed' => 'COMPLETED'
-                                ];
-                                
-                                $status_class_map = [
-                                    'draft' => 'new',
-                                    'scheduled' => 'new',
-                                    'running' => 'running',
-                                    'paused' => 'paused',
-                                    'completed' => 'completed'
                                 ];
                                 
                                 foreach ($campaigns as $campaign): 
@@ -565,8 +887,8 @@ try {
                                     $bounced_count = $campaign['emails_bounced'] > 0 ? $campaign['emails_bounced'] : $campaign['bounced_count'];
                                     $open_rate = $campaign['open_rate'];
                                     
-                                    $display_status = $status_map[$campaign['status']] ?? 'NEW';
-                                    $status_class = $status_class_map[$campaign['status']] ?? 'new';
+                                    $display_status = $status_display_map[$campaign['status']] ?? strtoupper($campaign['status']);
+                                    $status_class = strtolower($campaign['status']);
                                 ?>
                                 <tr data-campaign-id="<?php echo $campaign['id']; ?>" data-status="<?php echo $campaign['status']; ?>">
                                     <td>
@@ -613,6 +935,54 @@ try {
                                     <td class="campaign-date-cell">
                                         <?php echo date('M d, Y', strtotime($campaign['created_at'])); ?>
                                     </td>
+                                    <td>
+                                        <div class="campaign-actions-cell">
+                                            <!-- Edit Button -->
+                                            <a href="campaign_create.php?step=1&id=<?php echo $campaign['id']; ?>" 
+                                               class="campaign-action-btn btn-edit"
+                                               data-tooltip="Edit Campaign">
+                                                <i class="fas fa-edit"></i>
+                                            </a>
+                                            
+                                            <!-- View Button -->
+                                                <a href="campaign_view.php?id=<?php echo $campaign['id']; ?>" 
+                                                   class="campaign-action-btn btn-view"
+                                                   data-tooltip="View Details">
+                                                    <i class="fas fa-eye"></i>
+                                                </a>
+                                            
+                                            <!-- Pause/Resume Button -->
+                                            <?php if ($campaign['status'] == 'running'): ?>
+                                            <button class="campaign-action-btn btn-pause"
+                                                    onclick="pauseCampaign(<?php echo $campaign['id']; ?>)"
+                                                    data-tooltip="Pause Campaign">
+                                                <i class="fas fa-pause"></i>
+                                            </button>
+                                            <?php elseif ($campaign['status'] == 'paused'): ?>
+                                            <button class="campaign-action-btn btn-resume"
+                                                    onclick="resumeCampaign(<?php echo $campaign['id']; ?>)"
+                                                    data-tooltip="Resume Campaign">
+                                                <i class="fas fa-play"></i>
+                                            </button>
+                                            <?php endif; ?>
+                                            
+                                            <!-- Duplicate Button -->
+                                            <?php if ($campaign['status'] == 'draft' || $campaign['status'] == 'completed'): ?>
+                                            <button class="campaign-action-btn btn-duplicate"
+                                                    onclick="duplicateCampaign(<?php echo $campaign['id']; ?>)"
+                                                    data-tooltip="Duplicate Campaign">
+                                                <i class="fas fa-copy"></i>
+                                            </button>
+                                            <?php endif; ?>
+                                            
+                                            <!-- Delete Button -->
+                                            <button class="campaign-action-btn btn-delete"
+                                                    onclick="confirmDelete(<?php echo $campaign['id']; ?>, '<?php echo htmlspecialchars($campaign['name']); ?>')"
+                                                    data-tooltip="Delete Campaign">
+                                                <i class="fas fa-trash"></i>
+                                            </button>
+                                        </div>
+                                    </td>
                                 </tr>
                                 <?php endforeach; ?>
                             <?php endif; ?>
@@ -624,22 +994,47 @@ try {
                 <?php if (count($campaigns) > 0): ?>
                 <div class="pagination-section">
                     <div class="pagination-info">
-                        Showing 1-12 of 12
+                        Showing 1-<?php echo count($campaigns); ?> of <?php echo count($campaigns); ?>
                     </div>
                     <div class="pagination-controls">
                         <div class="page-numbers">
-                            <button class="pagination-btn">1</button>
+                            <button class="pagination-btn active">1</button>
+                            <?php if (count($campaigns) > 12): ?>
                             <button class="pagination-btn">2</button>
                             <button class="pagination-btn">3</button>
+                            <?php endif; ?>
                         </div>
+                        <?php if (count($campaigns) > 12): ?>
                         <button class="pagination-btn">
-                            More videos
+                            <i class="fas fa-chevron-right"></i> Next
                         </button>
+                        <?php endif; ?>
                     </div>
                 </div>
                 <?php endif; ?>
             </section>
         </main>
+    </div>
+
+    <!-- Confirmation Modal for Delete -->
+    <div class="confirmation-modal" id="deleteModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Delete Campaign</h3>
+            </div>
+            <div class="modal-body">
+                <p>Are you sure you want to delete "<span id="deleteCampaignName"></span>"?</p>
+                <p class="text-danger">This action cannot be undone.</p>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-btn cancel" onclick="closeModal()">Cancel</button>
+                <form id="deleteForm" method="POST" style="display: inline;">
+                    <input type="hidden" name="campaign_id" id="deleteCampaignId">
+                    <input type="hidden" name="action" value="delete">
+                    <button type="submit" class="modal-btn confirm">Delete</button>
+                </form>
+            </div>
+        </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/toastify-js"></script>
@@ -673,7 +1068,7 @@ try {
     // Row click (for selection)
     document.querySelectorAll('#campaignsTableBody tr[data-campaign-id]').forEach(row => {
         row.addEventListener('click', function(e) {
-            if (e.target.type !== 'checkbox') {
+            if (e.target.type !== 'checkbox' && !e.target.closest('.campaign-actions-cell')) {
                 const checkbox = this.querySelector('.campaign-checkbox');
                 checkbox.checked = !checkbox.checked;
             }
@@ -703,6 +1098,94 @@ try {
         }
     }
     
+    // Campaign Actions
+   
+    function pauseCampaign(campaignId) {
+        if (confirm('Are you sure you want to pause this campaign?')) {
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.style.display = 'none';
+            
+            const campaignIdInput = document.createElement('input');
+            campaignIdInput.type = 'hidden';
+            campaignIdInput.name = 'campaign_id';
+            campaignIdInput.value = campaignId;
+            
+            const actionInput = document.createElement('input');
+            actionInput.type = 'hidden';
+            actionInput.name = 'action';
+            actionInput.value = 'pause';
+            
+            form.appendChild(campaignIdInput);
+            form.appendChild(actionInput);
+            document.body.appendChild(form);
+            form.submit();
+        }
+    }
+    
+    function resumeCampaign(campaignId) {
+        if (confirm('Are you sure you want to resume this campaign?')) {
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.style.display = 'none';
+            
+            const campaignIdInput = document.createElement('input');
+            campaignIdInput.type = 'hidden';
+            campaignIdInput.name = 'campaign_id';
+            campaignIdInput.value = campaignId;
+            
+            const actionInput = document.createElement('input');
+            actionInput.type = 'hidden';
+            actionInput.name = 'action';
+            actionInput.value = 'resume';
+            
+            form.appendChild(campaignIdInput);
+            form.appendChild(actionInput);
+            document.body.appendChild(form);
+            form.submit();
+        }
+    }
+    
+    function duplicateCampaign(campaignId) {
+        if (confirm('Are you sure you want to duplicate this campaign?')) {
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.style.display = 'none';
+            
+            const campaignIdInput = document.createElement('input');
+            campaignIdInput.type = 'hidden';
+            campaignIdInput.name = 'campaign_id';
+            campaignIdInput.value = campaignId;
+            
+            const actionInput = document.createElement('input');
+            actionInput.type = 'hidden';
+            actionInput.name = 'action';
+            actionInput.value = 'duplicate';
+            
+            form.appendChild(campaignIdInput);
+            form.appendChild(actionInput);
+            document.body.appendChild(form);
+            form.submit();
+        }
+    }
+    
+    function confirmDelete(campaignId, campaignName) {
+        document.getElementById('deleteCampaignId').value = campaignId;
+        document.getElementById('deleteCampaignName').textContent = campaignName;
+        document.getElementById('deleteModal').style.display = 'flex';
+    }
+    
+    function closeModal() {
+        document.getElementById('deleteModal').style.display = 'none';
+    }
+    
+    // Close modal when clicking outside
+    document.getElementById('deleteModal').addEventListener('click', function(e) {
+        if (e.target === this) {
+            closeModal();
+        }
+    });
+    
     // Prevent focus on all elements
     document.addEventListener('DOMContentLoaded', function() {
         // Remove focus from all elements
@@ -712,36 +1195,18 @@ try {
                 this.blur();
             });
         });
+        
+        // Add tooltip functionality
+        document.querySelectorAll('.campaign-action-btn').forEach(btn => {
+            btn.addEventListener('mouseenter', function() {
+                this.classList.add('tooltip-active');
+            });
+            
+            btn.addEventListener('mouseleave', function() {
+                this.classList.remove('tooltip-active');
+            });
+        });
     });
     </script>
 </body>
 </html>
-
-<?php
-// Helper function for time ago
-function time_ago($date) {
-    $timestamp = strtotime($date);
-    $current_time = time();
-    $diff = $current_time - $timestamp;
-    
-    $intervals = array(
-        31536000 => 'year',
-        2592000 => 'month',
-        604800 => 'week',
-        86400 => 'day',
-        3600 => 'hour',
-        60 => 'minute',
-        1 => 'second'
-    );
-    
-    foreach ($intervals as $seconds => $label) {
-        $div = $diff / $seconds;
-        if ($div >= 1) {
-            $rounded = floor($div);
-            return $rounded . ' ' . $label . ($rounded > 1 ? 's' : '') . ' ago';
-        }
-    }
-    
-    return 'just now';
-}
-?>

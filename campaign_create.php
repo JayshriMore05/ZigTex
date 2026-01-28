@@ -7,7 +7,6 @@ if (!isset($_SESSION['user_id'])) {
     exit();
 }
 
-
 $user_id = $_SESSION['user_id'];
 $step = isset($_GET['step']) ? (int)$_GET['step'] : 1;
 $campaign_name = isset($_GET['name']) ? htmlspecialchars($_GET['name']) : 'Campaign ' . date('Y-m-d');
@@ -24,9 +23,6 @@ try {
     $stmt = $db->prepare("SELECT * FROM user_email_accounts WHERE user_id = ?");
     $stmt->execute([$user_id]);
     $email_accounts = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    
-    // REMOVED: Don't add default email automatically
-    // Users must add their own email accounts
     
     // Get default email if exists
     $default_email = '';
@@ -84,7 +80,12 @@ if (!isset($_SESSION['campaign_data'])) {
             'weekly_schedule' => explode(',', $existing_campaign['weekly_schedule'] ?? 'Mon,Tue,Wed,Thu,Fri'),
             'start_time' => $existing_campaign['start_time'] ?? '09:00',
             'end_time' => $existing_campaign['end_time'] ?? '19:00'
-        ] : [],
+        ] : [
+            'timezone' => 'Europe/London',
+            'weekly_schedule' => ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'],
+            'start_time' => '09:00',
+            'end_time' => '19:00'
+        ],
         'step3' => [],
         'steps' => []  // Store multiple email steps
     ];
@@ -104,6 +105,31 @@ if (!isset($_SESSION['campaign_data'])) {
 } else {
     // Update campaign name if changed
     $_SESSION['campaign_data']['campaign_name'] = $campaign_name;
+    
+    // Ensure step2 has all required keys with defaults
+    if (!isset($_SESSION['campaign_data']['step2'])) {
+        $_SESSION['campaign_data']['step2'] = [
+            'timezone' => 'Europe/London',
+            'weekly_schedule' => ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'],
+            'start_time' => '09:00',
+            'end_time' => '19:00'
+        ];
+    } else {
+        // Ensure weekly_schedule is an array
+        if (!isset($_SESSION['campaign_data']['step2']['weekly_schedule']) || !is_array($_SESSION['campaign_data']['step2']['weekly_schedule'])) {
+            $_SESSION['campaign_data']['step2']['weekly_schedule'] = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'];
+        }
+        // Ensure other keys exist
+        if (!isset($_SESSION['campaign_data']['step2']['timezone'])) {
+            $_SESSION['campaign_data']['step2']['timezone'] = 'Europe/London';
+        }
+        if (!isset($_SESSION['campaign_data']['step2']['start_time'])) {
+            $_SESSION['campaign_data']['step2']['start_time'] = '09:00';
+        }
+        if (!isset($_SESSION['campaign_data']['step2']['end_time'])) {
+            $_SESSION['campaign_data']['step2']['end_time'] = '19:00';
+        }
+    }
 }
 
 // Handle form submission
@@ -132,6 +158,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $weekly_schedule = $_POST['weekly_schedule'] ?? ($_SESSION['campaign_data']['step2']['weekly_schedule'] ?? ['Mon', 'Tue', 'Wed', 'Thu', 'Fri']);
             $start_time = $_POST['start_time'] ?? ($_SESSION['campaign_data']['step2']['start_time'] ?? '09:00');
             $end_time = $_POST['end_time'] ?? ($_SESSION['campaign_data']['step2']['end_time'] ?? '19:00');
+            
+            // Ensure weekly_schedule is an array
+            if (!is_array($weekly_schedule)) {
+                $weekly_schedule = explode(',', $weekly_schedule);
+            }
             
             $_SESSION['campaign_data']['step2'] = [
                 'timezone' => $timezone,
@@ -221,13 +252,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } elseif ($action === 'save_draft') {
         if (saveCampaign('draft')) {
             unset($_SESSION['campaign_data']);
-            header("Location: campaigns.php?success=draft_saved");
+            // Redirect to campaigns.php with success message
+            header("Location: campaign.php?success=draft_saved");
+            exit();
+        } else {
+            header("Location: campaign_create.php?step=$step&name=" . urlencode($campaign_name) . ($is_edit ? "&id=$campaign_id" : "") . "&error=draft_failed");
             exit();
         }
     } elseif ($action === 'launch') {
-        if (saveCampaign('active')) {
+        if (saveCampaign('running')) {
             unset($_SESSION['campaign_data']);
-            header("Location: campaigns.php?success=campaign_launched");
+            // Redirect to campaigns.php with success message
+            header("Location: campaign.php?success=campaign_launched");
+            exit();
+        } else {
+            header("Location: campaign_create.php?step=$step&name=" . urlencode($campaign_name) . ($is_edit ? "&id=$campaign_id" : "") . "&error=launch_failed");
             exit();
         }
     }
@@ -252,7 +291,7 @@ function saveCampaign($status = 'draft') {
         $steps = $data['steps'] ?? [];
         
         // Only validate email account if it's required for launch
-        if ($status === 'active' && empty($step1['email_account'])) {
+        if ($status === 'running' && empty($step1['email_account'])) {
             $_SESSION['error'] = 'Please select an email account to launch campaign';
             return false;
         }
@@ -265,9 +304,11 @@ function saveCampaign($status = 'draft') {
             'unsubscribe_text' => $step1['unsubscribe_text'] ?? '',
             'email_priority' => $step1['email_priority'] ?? 'equally_divided',
             'timezone' => $step2['timezone'] ?? 'Europe/London',
-            'weekly_schedule' => is_array($step2['weekly_schedule'] ?? []) ? 
-                implode(',', $step2['weekly_schedule']) : 
-                ($step2['weekly_schedule'] ?? 'Mon,Tue,Wed,Thu,Fri'),
+            'weekly_schedule' => !empty($step2['weekly_schedule']) ? 
+                (is_array($step2['weekly_schedule']) ? 
+                    implode(',', $step2['weekly_schedule']) : 
+                    $step2['weekly_schedule']) : 
+                'Mon,Tue,Wed,Thu,Fri',
             'start_time' => $step2['start_time'] ?? '09:00',
             'end_time' => $step2['end_time'] ?? '19:00',
             'total_prospects' => $step3['prospect_count'] ?? 0,
@@ -359,6 +400,7 @@ function saveCampaign($status = 'draft') {
         }
     } catch (Exception $e) {
         error_log("Campaign save error: " . $e->getMessage());
+        $_SESSION['error'] = 'Failed to save campaign: ' . $e->getMessage();
         return false;
     }
 }
@@ -1258,7 +1300,6 @@ textarea {
                 <!-- Step 1: Channel Setup -->
                 <form id="step1Form" class="form-section <?php echo $step == 1 ? 'active' : ''; ?>" method="POST" action="">
                     <input type="hidden" name="step" value="1">
-                    <input type="hidden" name="action" value="next">
                     
                     <div class="form-group">
                         <label class="required">Select Email Account</label>
@@ -1319,7 +1360,6 @@ textarea {
                 <!-- Step 2: Campaign Settings -->
                 <form id="step2Form" class="form-section <?php echo $step == 2 ? 'active' : ''; ?>" method="POST" action="">
                     <input type="hidden" name="step" value="2">
-                    <input type="hidden" name="action" value="next">
                     
                     <div class="form-group">
                         <label class="required">Timezone</label>
@@ -1404,7 +1444,6 @@ textarea {
                 <!-- Step 3: Prospect Import -->
                 <form id="step3Form" class="form-section <?php echo $step == 3 ? 'active' : ''; ?>" method="POST" action="" enctype="multipart/form-data">
                     <input type="hidden" name="step" value="3">
-                    <input type="hidden" name="action" value="next">
                     
                     <div style="text-align: center;">
                         <div class="upload-area" id="uploadArea">
@@ -1456,7 +1495,6 @@ textarea {
                 <!-- Step 4: Content -->
                 <form id="step4Form" class="form-section <?php echo $step == 4 ? 'active' : ''; ?>" method="POST" action="">
                     <input type="hidden" name="step" value="4">
-                    <input type="hidden" name="action" value="next">
                     <input type="hidden" name="step_number" id="stepNumber" value="<?php echo $current_step_number; ?>">
                     
                     <!-- Step Navigation Tabs -->
@@ -1573,7 +1611,11 @@ textarea {
                                 <div class="preview-value" id="previewSchedule">
                                     <?php 
                                     $schedule = $_SESSION['campaign_data']['step2']['weekly_schedule'] ?? ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'];
-                                    echo implode(', ', $schedule);
+                                    if (is_array($schedule)) {
+                                        echo implode(', ', $schedule);
+                                    } else {
+                                        echo $schedule;
+                                    }
                                     ?>
                                 </div>
                             </div>
@@ -2061,7 +2103,16 @@ textarea {
             
             // Add new step
             const newStepNumber = totalSteps + 1;
-            window.location.href = `campaign_create.php?step=4&substep=${newStepNumber}&name=<?php echo urlencode($campaign_name); ?><?php echo $is_edit ? "&id=$campaign_id" : ""; ?>`;
+            
+            // Create a form submission to add step
+            const form = document.getElementById('step4Form');
+            const actionInput = document.createElement('input');
+            actionInput.type = 'hidden';
+            actionInput.name = 'action';
+            actionInput.value = 'add_step';
+            
+            form.appendChild(actionInput);
+            form.submit();
         }
         
         function deleteStep(stepNumber) {
@@ -2116,11 +2167,14 @@ textarea {
                 // Submit form with save_draft action
                 const form = document.getElementById('step5Form');
                 if (form) {
+                    // Add action input
                     const actionInput = document.createElement('input');
                     actionInput.type = 'hidden';
                     actionInput.name = 'action';
                     actionInput.value = 'save_draft';
                     form.appendChild(actionInput);
+                    
+                    // Submit the form
                     form.submit();
                 }
             }
@@ -2128,9 +2182,7 @@ textarea {
         
         function launchCampaign() {
             // Check if required fields are filled for launch
-            const emailAccount = document.querySelector('input[name="email_account"]:checked');
-            if (!emailAccount) {
-                alert('Please select an email account to launch the campaign');
+            if (!validateCampaignForLaunch()) {
                 return;
             }
             
@@ -2138,14 +2190,43 @@ textarea {
                 // Submit form with launch action
                 const form = document.getElementById('step5Form');
                 if (form) {
+                    // Add action input
                     const actionInput = document.createElement('input');
                     actionInput.type = 'hidden';
                     actionInput.name = 'action';
                     actionInput.value = 'launch';
                     form.appendChild(actionInput);
+                    
+                    // Submit the form
                     form.submit();
                 }
             }
+        }
+        
+        function validateCampaignForLaunch() {
+            // Check email account
+            const emailAccount = document.querySelector('input[name="email_account"]:checked');
+            if (!emailAccount) {
+                alert('Please select an email account to launch the campaign');
+                return false;
+            }
+            
+            // Check unsubscribe text
+            const unsubscribeText = document.getElementById('previewUnsubscribe')?.textContent;
+            if (!unsubscribeText || unsubscribeText.trim() === 'Enter unsubscribe email text/link') {
+                if (!confirm('You haven\'t set an unsubscribe text/link. Continue anyway?')) {
+                    return false;
+                }
+            }
+            
+            // Check if there are email steps
+            const stepCount = document.getElementById('previewSequence')?.textContent;
+            if (!stepCount || stepCount.includes('0 steps')) {
+                alert('Please add at least one email to your sequence');
+                return false;
+            }
+            
+            return true;
         }
         
         function updatePreview() {
