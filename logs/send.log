@@ -1,0 +1,45 @@
+[2026-01-30 01:01:07] Starting email sending
+[2026-01-30 01:01:07] FATAL: SQLSTATE[42S02]: Base table or view not found: 1146 Table 'zigtex_db.campaign_queue' doesn't exist
+[2026-01-30 01:01:26] Starting email sending
+[2026-01-30 01:01:26] FATAL: SQLSTATE[42S02]: Base table or view not found: 1146 Table 'zigtex_db.campaign_queue' doesn't exist
+[2026-01-30 01:06:06] Starting email sending
+[2026-01-30 01:06:06] FATAL: SQLSTATE[42S02]: Base table or view not found: 1146 Table 'zigtex_db.campaign_queue' doesn't exist
+[2026-01-30 01:11:07] Starting email sending
+[2026-01-30 01:11:07] FATAL: SQLSTATE[42S02]: Base table or view not found: 1146 Table 'zigtex_db.campaign_queue' doesn't exist
+[2026-01-30 01:16:07] Starting email sending
+[2026-01-30 01:16:07] FATAL: SQLSTATE[42S02]: Base table or view not found: 1146 Table 'zigtex_db.campaign_queue' doesn't exist
+[2026-01-30 01:21:07] Starting email sending
+[2026-01-30 01:21:07] FATAL: SQLSTATE[42S02]: Base table or view not found: 1146 Table 'zigtex_db.campaign_queue' doesn't exist
+[2026-01-30 01:25:00] Starting email sending
+[2026-01-30 01:25:00] FATAL: SQLSTATE[42S02]: Base table or view not found: 1146 Table 'zigtex_db.email_sequences' doesn't exist
+[2026-01-30 01:26:07] Starting email sending
+[2026-01-30 01:26:07] FATAL: SQLSTATE[42S02]: Base table or view not found: 1146 Table 'zigtex_db.email_sequences' doesn't exist
+[2026-01-30 01:31:07] Starting email sending
+[2026-01-30 01:31:07] FATAL: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.company' in 'field list'
+[2026-01-29 01:33:58] Starting email sending
+[2026-01-29 01:33:58] FATAL: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'c.company' in 'field list'
+[2026-01-29 01:41:51] Starting email sending
+[2026-01-29 01:41:51] Found 0 pending emails
+[2026-01-29 01:41:51] Completed | Sent=0 Failed=0
+
+[2026-01-29 01:46:18] Starting email sending
+[2026-01-29 01:46:18] Found 1 pending emails
+[2026-01-29 01:46:18] FATAL: SQLSTATE[HY093]: Invalid parameter number
+[2026-01-29 01:58:45] Starting email sending
+[2026-01-29 01:58:45] Found 2 pending emails
+[2026-01-29 01:58:45] FATAL: SQLSTATE[HY093]: Invalid parameter number
+[2026-01-29 02:03:50] Starting email sending
+[2026-01-29 02:03:50] Found 2 pending emails
+[2026-01-29 02:10:23] Starting email sending
+[2026-01-29 02:10:23] Found 1 pending emails
+[2026-01-29 02:10:29] FATAL: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'failed_count' in 'field list'
+[2026-01-29 03:00:20] Starting email sending
+[2026-01-29 03:00:20] Found 0 pending emails
+[2026-01-29 03:00:20] Completed | Sent=0 Failed=0
+
+[2026-01-28 22:14:01] Starting email sending
+[2026-01-28 22:14:01] Found 0 pending emails
+[2026-01-28 22:29:51] Starting email sending
+[2026-01-28 22:29:51] Found 0 pending emails
+[2026-01-28 22:35:14] Starting email sending
+[2026-01-28 22:35:14] Found 0 pending emails

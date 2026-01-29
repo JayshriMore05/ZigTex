@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Campaign Setup</title>
+    <style>
+        .step { display: none; }
+        .step.active { display: block; }
+        .merge-tag { 
+            background: #e3f2fd; 
+            padding: 2px 6px; 
+            border-radius: 3px;
+            cursor: pointer;
+            margin: 0 2px;
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <!-- Step 1: SMTP Selection -->
+        <div class="step active" id="step1">
+            <h2>Select SMTP Account</h2>
+            <select id="smtpSelect">
+                <option value="">-- Select SMTP --</option>
+                <!-- Loaded via AJAX -->
+            </select>
+            <button onclick="addNewSMTP()">Add New SMTP</button>
+        </div>
+        
+        <!-- Step 2: Campaign Settings -->
+        <div class="step" id="step2">
+            <h2>Campaign Settings</h2>
+            <input type="text" id="campaignName" placeholder="Campaign Name">
+            <input type="number" id="dailyLimit" placeholder="Daily Limit (optional)">
+        </div>
+        
+        <!-- Step 3: Import Contacts -->
+        <div class="step" id="step3">
+            <h2>Import Contacts</h2>
+            <div>
+                <input type="file" id="csvFile" accept=".csv">
+                <button onclick="previewCSV()">Preview</button>
+            </div>
+            <div id="csvPreview"></div>
+        </div>
+        
+        <!-- Step 4: Email Sequence -->
+        <div class="step" id="step4">
+            <h2>Email Sequence</h2>
+            <div class="merge-tags">
+                <strong>Available Merge Tags:</strong>
+                <span class="merge-tag" onclick="insertTag('{{first_name}}')">{{first_name}}</span>
+                <span class="merge-tag" onclick="insertTag('{{company}}')">{{company}}</span>
+                <!-- Add more tags -->
+            </div>
+            
+            <div class="email-step">
+                <h3>Initial Email</h3>
+                <input type="text" class="subject" placeholder="Subject">
+                <textarea class="body" rows="10" placeholder="Email body..."></textarea>
+                <button onclick="addAnotherStep()">+ Add Another Step</button>
+            </div>
+        </div>
+        
+        <!-- Step 5: Preview & Start -->
+        <div class="step" id="step5">
+            <h2>Preview & Start</h2>
+            <button onclick="testSend()">Send Test Email</button>
+            <button onclick="startCampaign()" id="startBtn">Start Campaign</button>
+            <div id="progress" style="display:none;">
+                <progress id="progressBar" value="0" max="100"></progress>
+                <div id="status"></div>
+            </div>
+        </div>
+        
+        <!-- Navigation -->
+        <div style="margin-top: 20px;">
+            <button id="prevBtn" onclick="prevStep()" disabled>Previous</button>
+            <button id="nextBtn" onclick="nextStep()">Next</button>
+        </div>
+    </div>
+    
+    <script>
+        let currentStep = 1;
+        const totalSteps = 5;
+        let campaignData = {
+            smtp_config_id: null,
+            name: '',
+            contacts: [],
+            sequences: []
+        };
+        
+        function nextStep() {
+            if (currentStep < totalSteps) {
+                document.querySelector('.step.active').classList.remove('active');
+                currentStep++;
+                document.getElementById(`step${currentStep}`).classList.add('active');
+                updateButtons();
+            }
+        }
+        
+        function prevStep() {
+            if (currentStep > 1) {
+                document.querySelector('.step.active').classList.remove('active');
+                currentStep--;
+                document.getElementById(`step${currentStep}`).classList.add('active');
+                updateButtons();
+            }
+        }
+        
+        function updateButtons() {
+            document.getElementById('prevBtn').disabled = currentStep === 1;
+            document.getElementById('nextBtn').innerText = currentStep === totalSteps ? 'Finish' : 'Next';
+        }
+        
+        function insertTag(tag) {
+            const textarea = document.querySelector('#step4 textarea.body');
+            const start = textarea.selectionStart;
+            const end = textarea.selectionEnd;
+            textarea.value = textarea.value.substring(0, start) + tag + textarea.value.substring(end);
+            textarea.focus();
+        }
+        
+        async function startCampaign() {
+            const startBtn = document.getElementById('startBtn');
+            startBtn.disabled = true;
+            startBtn.innerText = 'Starting...';
+            
+            // Collect all data
+            campaignData.name = document.getElementById('campaignName').value;
+            campaignData.smtp_config_id = document.getElementById('smtpSelect').value;
+            
+            // Collect sequences
+            campaignData.sequences = [];
+            document.querySelectorAll('.email-step').forEach(step => {
+                campaignData.sequences.push({
+                    subject: step.querySelector('.subject').value,
+                    body: step.querySelector('.body').value
+                });
+            });
+            
+            // Send to backend
+            const response = await fetch('/api/campaign.php', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(campaignData)
+            });
+            
+            const result = await response.json();
+            
+            if (result.success) {
+                // Show progress
+                document.getElementById('progress').style.display = 'block';
+                pollProgress(result.campaign_id);
+            }
+        }
+        
+        function pollProgress(campaignId) {
+            setInterval(async () => {
+                const response = await fetch(`/api/progress.php?campaign_id=${campaignId}`);
+                const data = await response.json();
+                
+                document.getElementById('progressBar').value = data.percent;
+                document.getElementById('status').innerHTML = `
+                    Sent: ${data.sent}/${data.total}<br>
+                    Failed: ${data.failed}
+                `;
+                
+                if (data.percent >= 100) {
+                    clearInterval(this);
+                }
+            }, 3000); // Poll every 3 seconds
+        }
+        // Load existing SMTP configurations
+async function loadSMTPConfigs() {
+    try {
+        const response = await fetch('/api/smtp_list.php');
+        const data = await response.json();
+        
+        const select = document.getElementById('smtpSelect');
+        select.innerHTML = '<option value="">-- Select SMTP --</option>';
+        
+        data.forEach(config => {
+            const option = document.createElement('option');
+            option.value = config.id;
+            option.textContent = `${config.name} (${config.from_email})`;
+            select.appendChild(option);
+        });
+    } catch (error) {
+        console.error('Error loading SMTP configs:', error);
+    }
+}
+
+// Call this when page loads
+document.addEventListener('DOMContentLoaded', loadSMTPConfigs);
+    </script>
+</body>
+</html>

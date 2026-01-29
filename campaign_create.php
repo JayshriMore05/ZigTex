@@ -173,25 +173,98 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             break;
             
         case 3:
-            // Only process if file was uploaded
+            // CSV upload processing - FIXED VERSION
             if (isset($_FILES['csv_file']) && $_FILES['csv_file']['error'] === UPLOAD_ERR_OK) {
                 $file_info = [
                     'name' => $_FILES['csv_file']['name'],
                     'size' => $_FILES['csv_file']['size'],
                     'type' => $_FILES['csv_file']['type']
                 ];
+                
+                // Debug: Log file upload
+                error_log("CSV file uploaded: " . $_FILES['csv_file']['name'] . ", Size: " . $_FILES['csv_file']['size']);
+                
+                // Process CSV and count prospects
+                $csv_path = $_FILES['csv_file']['tmp_name'];
+                $prospect_count = 0;
+                $csv_contacts = [];
+                
+                if (($handle = fopen($csv_path, "r")) !== FALSE) {
+                    // Read the first line as headers
+                    $headers = fgetcsv($handle);
+                    if ($headers === FALSE) {
+                        error_log("CSV file is empty or invalid");
+                        $_SESSION['error'] = 'CSV file is empty or invalid';
+                    } else {
+                        // Debug: Log headers
+                        error_log("CSV Headers: " . print_r($headers, true));
+                        
+                        // Convert headers to lowercase for consistency
+                        $headers = array_map('strtolower', $headers);
+                        error_log("Normalized Headers: " . print_r($headers, true));
+                        
+                        while (($data = fgetcsv($handle)) !== FALSE) {
+                            // Skip empty rows
+                            if (empty(array_filter($data))) {
+                                continue;
+                            }
+                            
+                            // Ensure data has same number of columns as headers
+                            if (count($data) !== count($headers)) {
+                                error_log("Row data count mismatch: headers=" . count($headers) . ", data=" . count($data));
+                                continue;
+                            }
+                            
+                            $contact = array_combine($headers, $data);
+                            
+                            // Debug: Log contact data
+                            error_log("Contact data: " . print_r($contact, true));
+                            
+                            // Validate email
+                            if (!isset($contact['email']) || empty(trim($contact['email']))) {
+                                error_log("No email found in row");
+                                continue;
+                            }
+                            
+                            $email = trim($contact['email']);
+                            if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                                error_log("Invalid email: " . $email);
+                                continue;
+                            }
+                            
+                            $prospect_count++;
+                            $csv_contacts[] = $contact;
+                        }
+                        fclose($handle);
+                        
+                        error_log("Total valid contacts: " . $prospect_count);
+                    }
+                } else {
+                    error_log("Failed to open CSV file: " . $csv_path);
+                    $_SESSION['error'] = 'Failed to process CSV file';
+                }
+                
                 $_SESSION['campaign_data']['step3'] = [
                     'csv_uploaded' => true,
                     'file_info' => $file_info,
-                    'prospect_count' => 3
+                    'prospect_count' => $prospect_count,
+                    'csv_data' => $csv_contacts  // Store CSV data for later processing
                 ];
+                
+                // Debug: Log session data
+                error_log("Step3 session data: " . print_r($_SESSION['campaign_data']['step3'], true));
+                
             } elseif (isset($_POST['use_existing']) && $_POST['use_existing'] == '1') {
                 $_SESSION['campaign_data']['step3'] = [
                     'use_existing' => true,
                     'prospect_count' => 5
                 ];
+            } else {
+                // If no CSV uploaded and no existing list used, keep existing data
+                if (!isset($_SESSION['campaign_data']['step3'])) {
+                    $_SESSION['campaign_data']['step3'] = [];
+                }
             }
-            // If neither, keep existing data or leave empty
             break;
             
         case 4:
@@ -251,6 +324,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit();
     } elseif ($action === 'save_draft') {
         if (saveCampaign('draft')) {
+            // Process CSV contacts into queue if uploaded
+            if (isset($_SESSION['campaign_data']['step3']['csv_uploaded']) && 
+                $_SESSION['campaign_data']['step3']['csv_uploaded'] &&
+                isset($_SESSION['campaign_data']['step3']['csv_data'])) {
+                processCSVToQueue($campaign_id, $_SESSION['campaign_data']['step3']['csv_data']);
+            }
+            
             unset($_SESSION['campaign_data']);
             // Redirect to campaigns.php with success message
             header("Location: campaign.php?success=draft_saved");
@@ -261,6 +341,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     } elseif ($action === 'launch') {
         if (saveCampaign('running')) {
+            // Process CSV contacts into queue if uploaded
+            if (isset($_SESSION['campaign_data']['step3']['csv_uploaded']) && 
+                $_SESSION['campaign_data']['step3']['csv_uploaded'] &&
+                isset($_SESSION['campaign_data']['step3']['csv_data'])) {
+                processCSVToQueue($campaign_id, $_SESSION['campaign_data']['step3']['csv_data']);
+            }
+            
             unset($_SESSION['campaign_data']);
             // Redirect to campaigns.php with success message
             header("Location: campaign.php?success=campaign_launched");
@@ -272,17 +359,185 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
+// Check for errors from file upload
+$upload_error = '';
+if (isset($_SESSION['error'])) {
+    $upload_error = $_SESSION['error'];
+    unset($_SESSION['error']);
+}
+
+// Function to process CSV contacts and add to campaign queue WITH FOLLOW-UPS
+function processCSVToQueue($campaignId, $csvContacts) {
+    global $user_id, $db;
+    
+    try {
+        // Get email account from session
+        $emailAccount = $_SESSION['campaign_data']['step1']['email_account'] ?? '';
+        
+        // Get SMTP config ID for this email account
+        $stmt = $db->prepare("SELECT id FROM user_email_accounts WHERE email = ? AND user_id = ?");
+        $stmt->execute([$emailAccount, $user_id]);
+        $smtpConfig = $stmt->fetch(PDO::FETCH_ASSOC);
+        $smtpConfigId = $smtpConfig['id'] ?? 1;
+        
+        // Get ALL email sequences ordered by step number
+        $stmt = $db->prepare("SELECT * FROM campaign_steps WHERE campaign_id = ? ORDER BY step_number");
+        $stmt->execute([$campaignId]);
+        $sequences = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        if (empty($sequences)) {
+            error_log("No email sequences found for campaign $campaignId");
+            return false;
+        }
+        
+        // Prepare insert statements
+        $insertQueueStmt = $db->prepare("
+            INSERT INTO campaign_queue 
+            (campaign_id, sequence_id, smtp_config_id, contact_email, first_name, last_name, company, 
+             subject, body, status, scheduled_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        ");
+        
+        $inserted = 0;
+        $currentDateTime = new DateTime();
+        
+        foreach ($csvContacts as $contact) {
+            // Normalize contact data
+            $first = isset($contact['first_name']) ? $contact['first_name'] : 
+                    (isset($contact['firstname']) ? $contact['firstname'] : '');
+            $last = isset($contact['last_name']) ? $contact['last_name'] : 
+                   (isset($contact['lastname']) ? $contact['lastname'] : '');
+            $company = isset($contact['company']) ? $contact['company'] : '';
+            $email = isset($contact['email']) ? trim($contact['email']) : '';
+            
+            // Validate email
+            if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                continue;
+            }
+            
+            $totalDelayDays = 0;
+            $totalDelayHours = 0;
+            
+            // Process each sequence step
+            foreach ($sequences as $sequenceIndex => $sequence) {
+                $sequenceNumber = $sequenceIndex + 1;
+                
+                // Calculate scheduled time for this step
+                if ($sequenceNumber == 1) {
+                    // First email: send immediately
+                    $scheduledDate = clone $currentDateTime;
+                } else {
+                    // Follow-up emails: add cumulative delay
+                    $previousSequence = $sequences[$sequenceIndex - 1];
+                    $delayDays = $previousSequence['delay_days'] ?? 0;
+                    $delayHours = $previousSequence['delay_hours'] ?? 0;
+                    
+                    $totalDelayDays += $delayDays;
+                    $totalDelayHours += $delayHours;
+                    
+                    $scheduledDate = clone $currentDateTime;
+                    $scheduledDate->modify("+$totalDelayDays days");
+                    $scheduledDate->modify("+$totalDelayHours hours");
+                }
+                
+                // Replace merge tags in subject and body
+                $subject = replaceMergeTags($sequence['subject'], $contact);
+                $body = replaceMergeTags($sequence['email_body'], $contact);
+                
+                // Add unsubscribe link to body
+                $unsubscribeText = $_SESSION['campaign_data']['step1']['unsubscribe_text'] ?? '';
+                if (!empty($unsubscribeText)) {
+                    $body .= "\n\n---\n" . $unsubscribeText;
+                }
+                
+                // Insert into queue
+                $success = $insertQueueStmt->execute([
+                    $campaignId,
+                    $sequence['id'],
+                    $smtpConfigId,
+                    $email,
+                    $first,
+                    $last,
+                    $company,
+                    $subject,
+                    $body,
+                    $scheduledDate->format('Y-m-d H:i:s')
+                ]);
+                
+                if ($success) {
+                    if ($sequenceNumber == 1) {
+                        $inserted++; // Count unique prospects
+                    }
+                } else {
+                    error_log("Failed to insert into queue for email: $email, sequence: $sequenceNumber");
+                }
+            }
+        }
+        
+        // Update total prospects count
+        $updateStmt = $db->prepare("UPDATE campaigns SET total_prospects = ? WHERE id = ?");
+        $updateStmt->execute([$inserted, $campaignId]);
+        
+        // Calculate total emails in queue (prospects × sequences)
+        $totalEmails = $inserted * count($sequences);
+        
+        error_log("CSV processing completed: $inserted prospects, " . count($sequences) . " sequences, $totalEmails total emails");
+        
+        return [
+            'prospects' => $inserted,
+            'sequences' => count($sequences),
+            'total_emails' => $totalEmails
+        ];
+        
+    } catch (Exception $e) {
+        error_log("CSV to queue processing error: " . $e->getMessage());
+        return false;
+    }
+}
+
+// Function to replace merge tags in content
+function replaceMergeTags($content, $contact) {
+    // Normalize contact keys (case-insensitive)
+    $contactNormalized = [];
+    foreach ($contact as $key => $value) {
+        $contactNormalized[strtolower($key)] = $value;
+    }
+    
+    $tags = [
+        '{{first_name}}' => $contactNormalized['first_name'] ?? 
+                          $contactNormalized['firstname'] ?? '',
+        '{{last_name}}' => $contactNormalized['last_name'] ?? 
+                         $contactNormalized['lastname'] ?? '',
+        '{{company}}' => $contactNormalized['company'] ?? '',
+        '{{email}}' => $contactNormalized['email'] ?? '',
+        '{{linkedin_link}}' => $contactNormalized['linkedin_link'] ?? 
+                             $contactNormalized['linkedin'] ?? 
+                             $contactNormalized['linkedin_url'] ?? '',
+        '{{job_position}}' => $contactNormalized['job_position'] ?? 
+                            $contactNormalized['position'] ?? 
+                            $contactNormalized['job_title'] ?? '',
+        '{{industry}}' => $contactNormalized['industry'] ?? '',
+        '{{country}}' => $contactNormalized['country'] ?? '',
+        '{{lead_status}}' => $contactNormalized['lead_status'] ?? '',
+        '{{notes}}' => $contactNormalized['notes'] ?? ''
+    ];
+    
+    foreach ($tags as $tag => $value) {
+        $content = str_replace($tag, $value, $content);
+    }
+    
+    return $content;
+}
+
 // Function to save campaign to database
 function saveCampaign($status = 'draft') {
-    global $user_id, $campaign_id, $is_edit;
+    global $user_id, $campaign_id, $is_edit, $db;
     
     if (!isset($_SESSION['campaign_data'])) {
         return false;
     }
     
     try {
-        $db = db();
-        
         // Get data from session
         $data = $_SESSION['campaign_data'];
         $step1 = $data['step1'] ?? [];
@@ -408,7 +663,12 @@ function saveCampaign($status = 'draft') {
 // Get current step for step 4
 $current_step_number = isset($_GET['substep']) ? (int)$_GET['substep'] : 1;
 $total_steps = max(1, count($_SESSION['campaign_data']['steps'] ?? []));
+
+// Debug: Check session data
+error_log("Current Step: $step");
+error_log("Session data step3: " . print_r($_SESSION['campaign_data']['step3'] ?? 'No step3 data', true));
 ?>
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1214,6 +1474,17 @@ textarea {
     font-size: 13px;
     color: #666;
 }
+
+/* ===== ERROR MESSAGE ===== */
+.error-message {
+    background: #f8d7da;
+    border: 1px solid #f5c6cb;
+    color: #721c24;
+    padding: 15px;
+    border-radius: 10px;
+    margin-bottom: 20px;
+    font-size: 14px;
+}
     </style>
 </head>
 <body>
@@ -1297,6 +1568,12 @@ textarea {
                     </div>
                 </div>
 
+                <?php if (!empty($upload_error)): ?>
+                <div class="error-message">
+                    <i class="fas fa-exclamation-circle"></i> <?php echo htmlspecialchars($upload_error); ?>
+                </div>
+                <?php endif; ?>
+
                 <!-- Step 1: Channel Setup -->
                 <form id="step1Form" class="form-section <?php echo $step == 1 ? 'active' : ''; ?>" method="POST" action="">
                     <input type="hidden" name="step" value="1">
@@ -1356,6 +1633,7 @@ textarea {
                         </select>
                     </div>
                 </form>
+                
 
                 <!-- Step 2: Campaign Settings -->
                 <form id="step2Form" class="form-section <?php echo $step == 2 ? 'active' : ''; ?>" method="POST" action="">
@@ -1364,6 +1642,7 @@ textarea {
                     <div class="form-group">
                         <label class="required">Timezone</label>
                         <select name="timezone" id="timezone">
+
                             <option value="Europe/London" <?php echo ($_SESSION['campaign_data']['step2']['timezone'] ?? 'Europe/London') == 'Europe/London' ? 'selected' : ''; ?>>GMT +0:00 Europe/London</option>
                             <option value="Asia/Kolkata" <?php echo ($_SESSION['campaign_data']['step2']['timezone'] ?? '') == 'Asia/Kolkata' ? 'selected' : ''; ?>>GMT +5:30 Asia/Kolkata</option>
                             <option value="America/New_York" <?php echo ($_SESSION['campaign_data']['step2']['timezone'] ?? '') == 'America/New_York' ? 'selected' : ''; ?>>GMT -5:00 America/New_York</option>
@@ -1452,11 +1731,44 @@ textarea {
                             </div>
                             <div class="upload-text">Upload CSV file</div>
                             <div class="upload-subtext">Drag and drop or click to choose file</div>
-                            <input type="file" id="csvFile" name="csv_file" accept=".csv" style="display: none;">
+                            <input type="file" id="csvFile" name="csv_file" accept=".csv" style="display: none;" onchange="handleFileSelect(this)">
                             <button type="button" class="btn btn-next" onclick="document.getElementById('csvFile').click()" style="margin-top: 20px;">
                                 <i class="fas fa-upload"></i> Upload File
                             </button>
                         </div>
+                        
+                        <?php if (isset($_SESSION['campaign_data']['step3']['csv_uploaded']) && $_SESSION['campaign_data']['step3']['csv_uploaded']): ?>
+                        <div class="file-info" id="fileInfo" style="display: block; max-width: 500px; margin: 30px auto;">
+                            <div class="file-name" id="fileName">
+                                <i class="fas fa-file-csv"></i> <?php echo htmlspecialchars($_SESSION['campaign_data']['step3']['file_info']['name'] ?? ''); ?>
+                            </div>
+                            <div class="file-details" id="fileDetails">
+                                <?php 
+                                $fileSize = $_SESSION['campaign_data']['step3']['file_info']['size'] ?? 0;
+                                $prospectCount = $_SESSION['campaign_data']['step3']['prospect_count'] ?? 0;
+                                
+                                // Format file size
+                                if ($fileSize >= 1048576) {
+                                    $size = round($fileSize / 1048576, 2) . ' MB';
+                                } elseif ($fileSize >= 1024) {
+                                    $size = round($fileSize / 1024, 2) . ' KB';
+                                } else {
+                                    $size = $fileSize . ' Bytes';
+                                }
+                                
+                                echo "CSV file - " . $size . " - " . $prospectCount . " contacts found";
+                                ?>
+                            </div>
+                            <div style="margin-top: 10px; color: #28a745;">
+                                <i class="fas fa-check-circle"></i> File uploaded successfully
+                            </div>
+                        </div>
+                        <?php else: ?>
+                        <div class="file-info" id="fileInfo" style="display: none; max-width: 500px; margin: 30px auto;">
+                            <div class="file-name" id="fileName"></div>
+                            <div class="file-details" id="fileDetails"></div>
+                        </div>
+                        <?php endif; ?>
                         
                         <div style="margin: 30px 0; text-align: center;">
                             <div style="color: #666; margin-bottom: 15px; font-size: 16px;">Or</div>
@@ -1483,11 +1795,6 @@ textarea {
                             <button type="button" class="btn" onclick="showSampleData()">
                                 <i class="fas fa-eye"></i> View Sample Data
                             </button>
-                        </div>
-                        
-                        <div class="file-info" id="fileInfo" style="max-width: 500px; margin: 30px auto;">
-                            <div class="file-name" id="fileName"></div>
-                            <div class="file-details" id="fileDetails"></div>
                         </div>
                     </div>
                 </form>
@@ -1524,24 +1831,29 @@ textarea {
                     <div style="background: #f8f9fa; padding: 20px; border-radius: 12px; margin-bottom: 25px;">
                         <h4 style="margin-bottom: 15px; color: #333;">Follow-up Settings</h4>
                         <div class="delay-selector">
-                            <select name="delay_days" id="delayDays">
-                                <option value="0" <?php echo ($_SESSION['campaign_data']['steps'][$current_step_number]['delay_days'] ?? 0) == 0 ? 'selected' : ''; ?>>Immediate</option>
-                                <option value="1" <?php echo ($_SESSION['campaign_data']['steps'][$current_step_number]['delay_days'] ?? 2) == 1 ? 'selected' : ''; ?>>1 day</option>
-                                <option value="2" <?php echo ($_SESSION['campaign_data']['steps'][$current_step_number]['delay_days'] ?? 2) == 2 ? 'selected' : ''; ?>>2 days</option>
-                                <option value="3" <?php echo ($_SESSION['campaign_data']['steps'][$current_step_number]['delay_days'] ?? 2) == 3 ? 'selected' : ''; ?>>3 days</option>
-                                <option value="5" <?php echo ($_SESSION['campaign_data']['steps'][$current_step_number]['delay_days'] ?? 2) == 5 ? 'selected' : ''; ?>>5 days</option>
-                                <option value="7" <?php echo ($_SESSION['campaign_data']['steps'][$current_step_number]['delay_days'] ?? 2) == 7 ? 'selected' : ''; ?>>1 week</option>
-                                <option value="14" <?php echo ($_SESSION['campaign_data']['steps'][$current_step_number]['delay_days'] ?? 2) == 14 ? 'selected' : ''; ?>>2 weeks</option>
-                            </select>
-                            <span>and</span>
-                            <input type="number" name="delay_hours" id="delayHours" 
-                                   value="<?php echo $_SESSION['campaign_data']['steps'][$current_step_number]['delay_hours'] ?? 0; ?>"
-                                   min="0" max="23" placeholder="Hours">
-                            <span>hours</span>
+                            <div style="display: flex; gap: 10px; align-items: center;">
+                                <span>Send after</span>
+                                <select name="delay_days" id="delayDays" style="min-width: 100px;">
+                                    <option value="0" <?php echo ($_SESSION['campaign_data']['steps'][$current_step_number]['delay_days'] ?? 0) == 0 ? 'selected' : ''; ?>>0</option>
+                                    <option value="1" <?php echo ($_SESSION['campaign_data']['steps'][$current_step_number]['delay_days'] ?? 2) == 1 ? 'selected' : ''; ?>>1</option>
+                                    <option value="2" <?php echo ($_SESSION['campaign_data']['steps'][$current_step_number]['delay_days'] ?? 2) == 2 ? 'selected' : ''; ?>>2</option>
+                                    <option value="3" <?php echo ($_SESSION['campaign_data']['steps'][$current_step_number]['delay_days'] ?? 2) == 3 ? 'selected' : ''; ?>>3</option>
+                                    <option value="5" <?php echo ($_SESSION['campaign_data']['steps'][$current_step_number]['delay_days'] ?? 2) == 5 ? 'selected' : ''; ?>>5</option>
+                                    <option value="7" <?php echo ($_SESSION['campaign_data']['steps'][$current_step_number]['delay_days'] ?? 2) == 7 ? 'selected' : ''; ?>>7</option>
+                                </select>
+                                <span>days and</span>
+                                <input type="number" name="delay_hours" id="delayHours" 
+                                       value="<?php echo $_SESSION['campaign_data']['steps'][$current_step_number]['delay_hours'] ?? 0; ?>"
+                                       min="0" max="23" placeholder="0" style="width: 70px;">
+                                <span>hours</span>
+                            </div>
                             <button type="button" class="btn" style="background: #dc3545; color: white; margin-left: auto;" onclick="deleteStep(<?php echo $current_step_number; ?>)">
                                 <i class="fas fa-trash"></i> Remove Step
                             </button>
                         </div>
+                        <p style="color: #666; font-size: 13px; margin-top: 10px;">
+                            <i class="fas fa-info-circle"></i> This delay is calculated from when the previous email was sent.
+                        </p>
                     </div>
                     <?php endif; ?>
 
@@ -1632,15 +1944,33 @@ textarea {
                             <div class="preview-item">
                                 <div class="preview-label">Total Prospects</div>
                                 <div class="preview-value" id="previewProspects">
-                                    <?php echo $_SESSION['campaign_data']['step3']['prospect_count'] ?? '0'; ?> prospects
+                                    <?php 
+                                    $prospectCount = $_SESSION['campaign_data']['step3']['prospect_count'] ?? 0;
+                                    echo $prospectCount . ' prospect' . ($prospectCount != 1 ? 's' : '');
+                                    ?>
                                 </div>
                             </div>
                             <div class="preview-item">
                                 <div class="preview-label">Email Sequence</div>
                                 <div class="preview-value" id="previewSequence">
-                                    <?php echo count($_SESSION['campaign_data']['steps'] ?? []) ?: '1'; ?> steps
+                                    <?php 
+                                    $totalSteps = count($_SESSION['campaign_data']['steps'] ?? []) ?: 1;
+                                    echo $totalSteps . ' step' . ($totalSteps > 1 ? 's' : '');
+                                    ?>
                                 </div>
                             </div>
+                            <?php if (isset($_SESSION['campaign_data']['step3']['prospect_count']) && $_SESSION['campaign_data']['step3']['prospect_count'] > 0): ?>
+                            <div class="preview-item">
+                                <div class="preview-label">Total Emails</div>
+                                <div class="preview-value" id="previewTotalEmails" style="color: #007bff; font-weight: 600;">
+                                    <?php 
+                                    $prospects = $_SESSION['campaign_data']['step3']['prospect_count'] ?? 0;
+                                    $stepsCount = count($_SESSION['campaign_data']['steps'] ?? []) ?: 1;
+                                    echo ($prospects * $stepsCount) . ' email' . (($prospects * $stepsCount) != 1 ? 's' : '');
+                                    ?>
+                                </div>
+                            </div>
+                            <?php endif; ?>
                         </div>
                         
                         <div class="email-sequence-preview">
@@ -1656,18 +1986,38 @@ textarea {
                                     ];
                                 }
                                 
+                                $cumulativeDelayDays = 0;
+                                $cumulativeDelayHours = 0;
+                                
                                 foreach ($steps as $step_num => $step_data):
+                                    $delayText = '';
+                                    if ($step_num == 1) {
+                                        $delayText = 'Sends immediately';
+                                    } else {
+                                        $prevStep = $steps[$step_num - 1];
+                                        $cumulativeDelayDays += $prevStep['delay_days'] ?? 0;
+                                        $cumulativeDelayHours += $prevStep['delay_hours'] ?? 0;
+                                        
+                                        $delayText = 'Sends after ';
+                                        if ($cumulativeDelayDays > 0) {
+                                            $delayText .= $cumulativeDelayDays . ' day' . ($cumulativeDelayDays > 1 ? 's' : '');
+                                            if ($cumulativeDelayHours > 0) {
+                                                $delayText .= ', ';
+                                            }
+                                        }
+                                        if ($cumulativeDelayHours > 0) {
+                                            $delayText .= $cumulativeDelayHours . ' hour' . ($cumulativeDelayHours > 1 ? 's' : '');
+                                        }
+                                    }
                                 ?>
                                 <div class="email-step-preview">
                                     <div class="step-header">
                                         <div class="step-title">
                                             Step <?php echo $step_num; ?>: <?php echo $step_num == 1 ? 'Initial Email' : 'Follow-up Email'; ?>
                                         </div>
-                                        <?php if ($step_num > 1): ?>
                                         <div class="step-delay">
-                                            Sends after <?php echo $step_data['delay_days'] ?? 0; ?> days, <?php echo $step_data['delay_hours'] ?? 0; ?> hours
+                                            <?php echo $delayText; ?>
                                         </div>
-                                        <?php endif; ?>
                                     </div>
                                     <div class="email-subject">
                                         Subject: <?php echo htmlspecialchars($step_data['subject'] ?? 'No subject'); ?>
@@ -1721,7 +2071,6 @@ textarea {
                             Next <i class="fas fa-arrow-right"></i>
                         </button>
                         <?php endif; ?>
-                    </div>
                 </div>
             </div>
         </div>
@@ -1789,8 +2138,8 @@ textarea {
         let currentStep = <?php echo $step; ?>;
         let currentStepNumber = <?php echo $current_step_number; ?>;
         let totalSteps = <?php echo $total_steps; ?>;
-        let fileUploaded = <?php echo isset($_SESSION['campaign_data']['step3']['csv_uploaded']) ? 'true' : 'false'; ?>;
-        let existingListUsed = <?php echo isset($_SESSION['campaign_data']['step3']['use_existing']) ? 'true' : 'false'; ?>;
+        let fileUploaded = <?php echo isset($_SESSION['campaign_data']['step3']['csv_uploaded']) && $_SESSION['campaign_data']['step3']['csv_uploaded'] ? 'true' : 'false'; ?>;
+        let existingListUsed = <?php echo isset($_SESSION['campaign_data']['step3']['use_existing']) && $_SESSION['campaign_data']['step3']['use_existing'] ? 'true' : 'false'; ?>;
         
         document.addEventListener('DOMContentLoaded', function() {
             showStep(currentStep);
@@ -1801,6 +2150,11 @@ textarea {
             
             // Setup merge tags
             setupMergeTags();
+            
+            // Show file info if already uploaded
+            if (fileUploaded) {
+                document.getElementById('fileInfo').style.display = 'block';
+            }
         });
         
         function showStep(step) {
@@ -1893,7 +2247,21 @@ textarea {
             }
             
             if (currentStep < 5) {
-                // Submit form with next action
+                // For step 3, we need to submit the form to process the file
+                if (currentStep === 3) {
+                    const form = document.getElementById('step3Form');
+                    if (form) {
+                        const actionInput = document.createElement('input');
+                        actionInput.type = 'hidden';
+                        actionInput.name = 'action';
+                        actionInput.value = 'next';
+                        form.appendChild(actionInput);
+                        form.submit();
+                        return;
+                    }
+                }
+                
+                // For other steps, submit form with next action
                 const form = document.getElementById('step' + currentStep + 'Form');
                 if (form) {
                     const actionInput = document.createElement('input');
@@ -1956,7 +2324,15 @@ textarea {
                     return checkedDays.length === 0;
                     
                 case 3:
-                    return !fileUploaded && !existingListUsed;
+                    // For step 3, check if file is uploaded or existing list is used
+                    if (!fileUploaded && !existingListUsed) {
+                        // Check if there's a file selected
+                        const fileInput = document.getElementById('csvFile');
+                        if (fileInput.files.length === 0) {
+                            return true;
+                        }
+                    }
+                    return false;
                     
                 case 4:
                     const subject = document.getElementById('subject');
@@ -1979,6 +2355,13 @@ textarea {
                     option.classList.remove('selected');
                 });
                 radio.closest('.email-option').classList.add('selected');
+            }
+        }
+        
+        function handleFileSelect(input) {
+            if (input.files.length) {
+                const file = input.files[0];
+                handleFile(file);
             }
         }
         
@@ -2006,44 +2389,58 @@ textarea {
                 this.classList.remove('dragover');
                 
                 if (e.dataTransfer.files.length) {
-                    handleFile(e.dataTransfer.files[0]);
+                    const file = e.dataTransfer.files[0];
+                    fileInput.files = e.dataTransfer.files;
+                    handleFile(file);
                 }
             });
+        }
+        
+        function handleFile(file) {
+            if (file.type !== 'text/csv' && !file.name.toLowerCase().endsWith('.csv')) {
+                alert('Please upload a CSV file');
+                return;
+            }
             
-            // File input change
-            fileInput.addEventListener('change', function(e) {
-                if (this.files.length) {
-                    handleFile(this.files[0]);
-                }
-            });
+            const fileInfo = document.getElementById('fileInfo');
+            const fileName = document.getElementById('fileName');
+            const fileDetails = document.getElementById('fileDetails');
             
-            function handleFile(file) {
-                if (file.type !== 'text/csv' && !file.name.endsWith('.csv')) {
-                    alert('Please upload a CSV file');
-                    return;
-                }
+            fileInfo.style.display = 'block';
+            fileUploaded = true;
+            existingListUsed = false;
+            fileName.innerHTML = '<i class="fas fa-file-csv"></i> ' + file.name;
+            fileDetails.textContent = 'CSV file - ' + formatFileSize(file.size) + ' - Processing...';
+            
+            // Show count of contacts
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const content = e.target.result;
+                const lines = content.split('\n').filter(line => line.trim() !== '');
+                const contactCount = Math.max(0, lines.length - 1); // Subtract header
+                fileDetails.textContent = 'CSV file - ' + formatFileSize(file.size) + ' - ' + contactCount + ' contacts found';
                 
-                // Simulate file processing
-                fileUploaded = true;
-                existingListUsed = false;
-                fileInfo.classList.add('show');
-                fileName.textContent = file.name;
-                fileDetails.textContent = 'Comma Separated Spreadsheet (.csv) - ' + formatFileSize(file.size);
-                
-                // Simulate server processing
+                // Auto-submit form to save file
                 setTimeout(() => {
-                    alert('File uploaded successfully! 3 prospects found.');
-                    updatePreview();
-                }, 500);
-            }
-            
-            function formatFileSize(bytes) {
-                if (bytes === 0) return '0 Bytes';
-                const k = 1024;
-                const sizes = ['Bytes', 'KB', 'MB'];
-                const i = Math.floor(Math.log(bytes) / Math.log(k));
-                return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
-            }
+                    const form = document.getElementById('step3Form');
+                    const actionInput = document.createElement('input');
+                    actionInput.type = 'hidden';
+                    actionInput.name = 'action';
+                    actionInput.value = 'next';
+                    
+                    form.appendChild(actionInput);
+                    form.submit();
+                }, 1000);
+            };
+            reader.readAsText(file);
+        }
+        
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
         }
         
         function useExistingList() {
@@ -2056,8 +2453,21 @@ textarea {
             existingListUsed = true;
             fileUploaded = false;
             
-            alert('Using existing list: ' + select.options[select.selectedIndex].text);
-            updatePreview();
+            // Submit form to save selection
+            const form = document.getElementById('step3Form');
+            const useExistingInput = document.createElement('input');
+            useExistingInput.type = 'hidden';
+            useExistingInput.name = 'use_existing';
+            useExistingInput.value = '1';
+            
+            const actionInput = document.createElement('input');
+            actionInput.type = 'hidden';
+            actionInput.name = 'action';
+            actionInput.value = 'next';
+            
+            form.appendChild(useExistingInput);
+            form.appendChild(actionInput);
+            form.submit();
         }
         
         function downloadSample() {
@@ -2186,7 +2596,7 @@ textarea {
                 return;
             }
             
-            if (confirm('Launch this campaign? Emails will start sending according to your schedule.')) {
+            if (confirm('Launch this campaign? Each prospect will receive the full email sequence with follow-ups.')) {
                 // Submit form with launch action
                 const form = document.getElementById('step5Form');
                 if (form) {
@@ -2226,6 +2636,13 @@ textarea {
                 return false;
             }
             
+            // Check if there are prospects
+            const prospectCount = <?php echo $_SESSION['campaign_data']['step3']['prospect_count'] ?? 0; ?>;
+            if (prospectCount === 0) {
+                alert('Please upload a CSV file or select existing prospects');
+                return false;
+            }
+            
             return true;
         }
         
@@ -2244,11 +2661,12 @@ textarea {
                     }
                 }
                 
-                // Update prospect count
-                const prospectCount = fileUploaded ? 3 : (existingListUsed ? 5 : 0);
-                const prospectElement = document.getElementById('previewProspects');
-                if (prospectElement) {
-                    prospectElement.textContent = prospectCount + ' prospects';
+                // Update total emails count
+                const prospectCount = <?php echo $_SESSION['campaign_data']['step3']['prospect_count'] ?? 0; ?>;
+                const stepsCount = <?php echo count($_SESSION['campaign_data']['steps'] ?? []) ?: 1; ?>;
+                const totalEmailsElement = document.getElementById('previewTotalEmails');
+                if (totalEmailsElement && prospectCount > 0) {
+                    totalEmailsElement.textContent = (prospectCount * stepsCount) + ' email' + ((prospectCount * stepsCount) !== 1 ? 's' : '');
                 }
             }
         }
